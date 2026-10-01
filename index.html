@@ -617,8 +617,9 @@ const state = {
     empresa:"", vendedorNome:"", telefone:"", cidade:"", endereco:"", email:"",
     marcas:[],
     pix:{ chave:"" },
-    priceLabels:["À vista"],
     installments:[ {vezes:1,percent:0}, {vezes:2,percent:5}, {vezes:3,percent:8} ],
+    priceTables:[ { id:'t0', nome:'À vista', modo:'custo', percent:0, ativo:true } ],
+    tabelaPadraoSemCliente:'t0',
     feeCardDefault:{type:"%",value:"3.5"}, feeNotaDefault:{type:"%",value:"6"},
     vendedores:[],
     formasPagamento:['PIX','Dinheiro','Cartão de crédito','Cartão de débito','Boleto','Transferência'],
@@ -646,6 +647,7 @@ const state = {
   unlocked: false
 };
 
+function defaultPriceTableId(){ return tabelaPadraoDoCliente(null); }
 function defaultVendedorId(){
   const ativos=(state.config.vendedores||[]).filter(v=>v.ativo!==false);
   if(!ativos.length) return null;
@@ -665,7 +667,7 @@ function newBudget(){
     editingId:null,
     vendedorId: defaultVendedorId(), entregaObs:"",
     clientId:null, clientAvulsoNome:"", clientAvulsoTel:"",
-    priceIdx:0, installIdx:defaultInstallIdx, parcelamentoOn:true,
+    priceTableId: defaultPriceTableId(), installIdx:defaultInstallIdx, parcelamentoOn:true,
     sections:[ {title:"Fase 1", items:[], parcelOn:true} ],
     cardFee:{on:false,type:"%",value:""}, notaFee:{on:false,type:"%",value:""},
     discount:{on:false,type:"%",value:""}
@@ -761,6 +763,18 @@ async function loadAll(){
   const cl=await safe('clients',()=>cloudGet('clients')); if(cl) state.clients=typeof cl==='string'?JSON.parse(cl):cl;
   const pe=await safe('pedidos',()=>cloudGet('pedidos')); if(pe) state.pedidos=typeof pe==='string'?JSON.parse(pe):pe;
   const tp=await safe('templates',()=>cloudGet('templates')); if(tp) state.templates=typeof tp==='string'?JSON.parse(tp):tp;
+  if(!Array.isArray(state.config.vendedores)) state.config.vendedores=[];
+  if(!Array.isArray(state.config.priceTables) || !state.config.priceTables.length){
+    const labels = (c && typeof c==='object' && Array.isArray(c.priceLabels) && c.priceLabels.length) ? c.priceLabels : ['À vista'];
+    state.config.priceTables = labels.map((nome,i)=>({ id:'t'+i, nome, modo:'manual', percent:0, ativo:true }));
+    state.products.forEach(prod=>{
+      if(Array.isArray(prod.prices)){
+        prod.overrides = prod.overrides || {};
+        prod.prices.forEach((v,i)=>{ if(parseNum(v)>0 && state.config.priceTables[i]) prod.overrides[state.config.priceTables[i].id] = parseNum(v); });
+      }
+    });
+    if(!state.config.tabelaPadraoSemCliente) state.config.tabelaPadraoSemCliente = state.config.priceTables[0].id;
+  }
   applyTheme(state.config.theme||'exec');
   state.budget=newBudget();
   if(_draftBudget){ state.budget=_draftBudget; _draftBudget=null; }
@@ -980,6 +994,7 @@ function render(){
   if(needsBackupToday()){ app.innerHTML=''; return; }
   if(!window._firebaseReady){ app.innerHTML=''; return; }
   if(state.tab!=='inicio'){ state.inicioResumoAberto=false; state.inicioPagPendenteAberto=false; state.inicioFinAberto=false; state.inicioUrgAberto=false; clearTimeout(state._finTimer); }
+  if(state.tab!=='ajustes') _priceTablesSnapshot=null;
   if(state.tab==='inicio') app.innerHTML = renderInicio();
   else if(state.tab==='pendencias') app.innerHTML = renderPendencias();
   else if(state.tab==='relatorio') app.innerHTML = renderRelatorio();
@@ -1349,6 +1364,39 @@ function renderVendedorField(b){
   if(!lista.length) return `<p class="muted" style="margin:0;">Nenhum vendedor cadastrado. Cadastre em Ajustes → Vendedores.</p>`;
   return `<select data-act="selvendedor"><option value="">— selecione o vendedor —</option>${lista.map(v=>`<option value="${v.id}" ${b.vendedorId===v.id?'selected':''}>${escapeHtml(v.nome)}${v.ativo===false?' (inativo)':''}</option>`).join('')}</select>`;
 }
+function round2(v){ return Math.round((Number(v)||0)*100)/100; }
+function tabelasAtivas(){ return (state.config.priceTables||[]).filter(t=>t.ativo!==false); }
+function tabelaPorId(id, lista){ return (lista||state.config.priceTables||[]).find(t=>t.id===id); }
+/* Calcula o preço de um produto numa tabela: sobrescrita manual sempre vence; senão aplica a fórmula da tabela
+   (custo, % sobre a Tabela 1, ou % sobre a tabela anterior na ordem). Tabelas "manual" não têm fórmula: o valor
+   É a sobrescrita, ou 0 se nada foi digitado ainda. */
+function calcPrecoTabela(prod, tabelaId, tabelas, _memo, _path){
+  tabelas = tabelas || state.config.priceTables || [];
+  _memo = _memo || {}; _path = _path || new Set();
+  if(_memo[tabelaId] !== undefined) return _memo[tabelaId];
+  const tabela = tabelaPorId(tabelaId, tabelas);
+  if(!tabela){ _memo[tabelaId]=0; return 0; }
+  const ov = prod.overrides ? prod.overrides[tabelaId] : undefined;
+  if(ov!==undefined && ov!==null && ov!==''){ const v=round2(parseNum(ov)); _memo[tabelaId]=v; return v; }
+  if(tabela.modo==='manual' || _path.has(tabelaId)){ _memo[tabelaId]=0; return 0; }
+  _path.add(tabelaId);
+  const idx = tabelas.findIndex(t=>t.id===tabelaId);
+  let v=0;
+  if(tabela.modo==='tabela1' && tabelas[0]){ v = round2(calcPrecoTabela(prod, tabelas[0].id, tabelas, _memo, _path) * (1+parseNum(tabela.percent||0)/100)); }
+  else if(tabela.modo==='anterior' && idx>0){ v = round2(calcPrecoTabela(prod, tabelas[idx-1].id, tabelas, _memo, _path) * (1+parseNum(tabela.percent||0)/100)); }
+  else { v = round2(parseNum(prod.cost||0) * (1+parseNum(tabela.percent||0)/100)); } // 'custo', ou fórmula inválida (ex: 1ª tabela = tabela1/anterior) cai para custo
+  _path.delete(tabelaId);
+  _memo[tabelaId]=v; return v;
+}
+function nomeTabela(id){ const t=tabelaPorId(id); return t ? t.nome : ''; }
+function tabelaPadraoDoCliente(clientId){
+  const c = state.clients.find(x=>x.id===clientId);
+  const id = c && c.tabelaPadraoId;
+  if(id && tabelaPorId(id) && tabelaPorId(id).ativo!==false) return id;
+  const def = state.config.tabelaPadraoSemCliente;
+  if(def && tabelaPorId(def) && tabelaPorId(def).ativo!==false) return def;
+  const a = tabelasAtivas(); return a.length ? a[0].id : null;
+}
 function renderClienteField(b){
   if(b.clientId && b.clientId!=='avulso'){
     const c = state.clients.find(x=>x.id===b.clientId);
@@ -1371,7 +1419,7 @@ function renderOrcamento(){
   const b = state.budget;
   const cfg = state.config;
   const t = calcTotals(b);
-  const priceLabelBtns = state.config.priceLabels.map((lbl,i)=>`<button type="button" class="btn-sm ${b.priceIdx===i?'btn-primary':'btn-ghost'}" data-priceidx="${i}" style="flex:1">${escapeHtml(lbl)}</button>`).join('');
+  const priceLabelBtns = tabelasAtivas().map(t=>`<button type="button" class="btn-sm ${b.priceTableId===t.id?'btn-primary':'btn-ghost'}" data-pricetable="${t.id}" style="flex:1">${escapeHtml(t.nome)}</button>`).join('') || `<p class="muted" style="margin:0;">Nenhuma tabela de preço ativa. Cadastre em Ajustes → Tabelas de preço.</p>`;
   const instOpts = state.config.installments.map((it,i)=>`<option value="${i}" ${b.installIdx===i?'selected':''}>${it.vezes}x${it.percent?` (+${it.percent}%)`:''}</option>`).join('');
 
   const sectionsHtml = b.sections.map((sec,si)=>{
@@ -1524,7 +1572,7 @@ function wireTabEvents(){
   const app = document.getElementById('app');
   const b = state.budget;
 
-  app.querySelectorAll('[data-priceidx]').forEach(btn=> btn.addEventListener('click', ()=>{ b.priceIdx=Number(btn.dataset.priceidx); render(); }));
+  app.querySelectorAll('[data-pricetable]').forEach(btn=> btn.addEventListener('click', ()=>{ b.priceTableId=btn.dataset.pricetable; render(); }));
   const um = app.querySelector('[data-act=usarmodelo]'); if(um) um.addEventListener('click', ()=> templatesModal());
   const sm = app.querySelector('[data-act=salvarmodelo]'); if(sm) sm.addEventListener('click', ()=> salvarComoModelo());
   const selInstall = app.querySelector('[data-act=selinstall]');
@@ -1532,7 +1580,7 @@ function wireTabEvents(){
   const selclient = app.querySelector('[data-act=selclient]');
   if(selclient) selclient.addEventListener('change', e=>{ b.clientId = e.target.value||null; render(); });
   const abrirCliBtn = app.querySelector('[data-act=abrircliente]');
-  if(abrirCliBtn) abrirCliBtn.addEventListener('click', ()=>{ openClientPicker(cid=>{ b.clientId = cid; render(); }); });
+  if(abrirCliBtn) abrirCliBtn.addEventListener('click', ()=>{ openClientPicker(cid=>{ b.clientId = cid; b.priceTableId = tabelaPadraoDoCliente(cid); render(); }); });
   const trocarBtn = app.querySelector('[data-act=trocarcliente]'); if(trocarBtn) trocarBtn.addEventListener('click', ()=>{ b.clientId=null; render(); });
   const avulsoBtn = app.querySelector('[data-act=clienteavulso]'); if(avulsoBtn) avulsoBtn.addEventListener('click', ()=>{ b.clientId='avulso'; render(); });
   const avNome = app.querySelector('[data-act=avulsoNome]'); if(avNome) avNome.addEventListener('input', e=> b.clientAvulsoNome=e.target.value);
@@ -1589,7 +1637,7 @@ function wireTabEvents(){
       const idx = b.sections[si].items.length-1;
       render(); focarNovaLinha(si, idx);
     };
-    const daProduto = (pr)=>({ id:uid(), name:pr.name, qty:1, price:pr.prices[b.priceIdx]||0, cost:pr.cost||0, productId:pr.id });
+    const daProduto = (pr)=>({ id:uid(), name:pr.name, qty:1, price:calcPrecoTabela(pr, b.priceTableId), cost:pr.cost||0, productId:pr.id });
     const desenhar = ()=>{
       const q = normSearch(inp.value.trim());
       let itens = state.products.slice();
@@ -1597,7 +1645,7 @@ function wireTabEvents(){
       itens.sort((x,y)=>String(x.name).localeCompare(String(y.name),'pt-BR'));
       lista = itens.slice(0,8);
       if(sel>=lista.length) sel = Math.max(0, lista.length-1);
-      box.innerHTML = lista.map((pr,i)=>`<div data-i="${i}" class="${i===sel?'sel':''}"><span>${escapeHtml(pr.name)}<small>${escapeHtml(pr.fornecedor||'')}</small></span><b class="num">R$ ${money(pr.prices[b.priceIdx]||0)}</b></div>`).join('')
+      box.innerHTML = lista.map((pr,i)=>`<div data-i="${i}" class="${i===sel?'sel':''}"><span>${escapeHtml(pr.name)}<small>${escapeHtml(pr.fornecedor||'')}</small></span><b class="num">R$ ${money(calcPrecoTabela(pr, b.priceTableId))}</b></div>`).join('')
         + `<div data-novo="1" class="novo"><span>+ Cadastrar produto novo…</span></div>`;
       box.classList.remove('hidden');
     };
@@ -1609,14 +1657,14 @@ function wireTabEvents(){
         e.preventDefault();
         if(box.classList.contains('hidden') && inp.value.trim()){ desenhar(); return; }
         if(lista[sel] && !box.classList.contains('hidden')) adicionar(daProduto(lista[sel]));
-        else if(inp.value.trim()){ quickProductModal(b.priceIdx, data=> adicionar({ id:uid(), name:data.name, qty:1, price:data.price||0, cost:data.cost||0, productId:data.productId||null })); }
+        else if(inp.value.trim()){ quickProductModal(b.priceTableId, data=> adicionar({ id:uid(), name:data.name, qty:1, price:data.price||0, cost:data.cost||0, productId:data.productId||null })); }
       }
       else if(e.key==='Escape'){ box.classList.add('hidden'); }
     });
     box.addEventListener('mousedown', e=>{
       const d = e.target.closest('[data-i]'); const n = e.target.closest('[data-novo]');
       if(d){ e.preventDefault(); adicionar(daProduto(lista[Number(d.dataset.i)])); }
-      else if(n){ e.preventDefault(); quickProductModal(b.priceIdx, data=> adicionar({ id:uid(), name:data.name, qty:1, price:data.price||0, cost:data.cost||0, productId:data.productId||null })); }
+      else if(n){ e.preventDefault(); quickProductModal(b.priceTableId, data=> adicionar({ id:uid(), name:data.name, qty:1, price:data.price||0, cost:data.cost||0, productId:data.productId||null })); }
     });
     inp.addEventListener('blur', ()=> setTimeout(()=> box.classList.add('hidden'), 160));
   });
@@ -1624,11 +1672,11 @@ function wireTabEvents(){
   app.querySelectorAll('[data-act=abrirbuscaproduto]').forEach(btn=>{
     const si = Number(btn.dataset.si);
     btn.addEventListener('click', ()=>{
-      openProductPicker(b.priceIdx, sel=>{
+      openProductPicker(b.priceTableId, sel=>{
         let item;
         if(typeof sel==='string'){
           const prod = state.products.find(p=>p.id===sel);
-          item = {id:uid(), name:prod.name, qty:1, price:prod.prices[b.priceIdx]||0, cost:prod.cost||0, productId:prod.id};
+          item = {id:uid(), name:prod.name, qty:1, price:calcPrecoTabela(prod, b.priceTableId), cost:prod.cost||0, productId:prod.id};
         } else {
           item = {id:uid(), name:sel.name, qty:1, price:sel.price||0, cost:sel.cost||0, productId:sel.productId||null};
         }
@@ -1791,7 +1839,7 @@ async function buildPedidoFromBudget(existingId){
     vendedorId: b.vendedorId||null,
     vendedorNome: vend ? vend.nome : ((existing && existing.vendedorNome) || ''),
     entregaObs: String(b.entregaObs||'').trim(),
-    priceIdx:b.priceIdx, installIdx:b.installIdx,
+    priceTableId:b.priceTableId, priceTableNome: nomeTabela(b.priceTableId), installIdx:b.installIdx,
     sections: JSON.parse(JSON.stringify(b.sections)),
     cardFee: JSON.parse(JSON.stringify(b.cardFee)), notaFee: JSON.parse(JSON.stringify(b.notaFee)),
     discount: JSON.parse(JSON.stringify(b.discount||{on:false,type:'%',value:''})),
@@ -1850,7 +1898,7 @@ function carregarPedidoParaEdicao(p){
     clientId: p.clientId || (p.clientName ? 'avulso' : null),
     clientAvulsoNome: p.clientId ? "" : (p.clientName||""),
     clientAvulsoTel: p.clientId ? "" : (p.clientPhone||""),
-    priceIdx: p.priceIdx||0, installIdx: p.installIdx||0,
+    priceTableId: p.priceTableId || defaultPriceTableId(), installIdx: p.installIdx||0,
     sections: JSON.parse(JSON.stringify(p.sections)),
     cardFee: JSON.parse(JSON.stringify(p.cardFee||{on:false,type:'%',value:''})),
     notaFee: JSON.parse(JSON.stringify(p.notaFee||{on:false,type:'%',value:''})),
@@ -3075,9 +3123,9 @@ function renderProdutos(){
 }
 function prodRowsHtml(){
   const cfg = state.config;
-  const inst = cfg.installments[cfg.parceladoPadraoIdx];
-  const pct = inst ? parseNum(inst.percent) : 0;
-  const vezesLabel = inst ? `${inst.vezes}x` : 'A prazo';
+  const tabList = tabelasAtivas();
+  const tabPadrao = tabelaPorId(cfg.tabelaPadraoSemCliente) || tabList[0];
+  const vezesLabel = tabPadrao ? tabPadrao.nome : '—';
   const filtered = state.products.filter(p=>{
     const matchTexto = !prodFilter || normSearch(p.name).includes(normSearch(prodFilter)) || normSearch(p.fornecedor||'').includes(normSearch(prodFilter));
     const matchForn = !prodFornFilter || p.fornecedor===prodFornFilter;
@@ -3087,23 +3135,21 @@ function prodRowsHtml(){
   if(isDesk()){
     const info = paginar(filtered, state.pgProdutos||1, paginaTam(390, 41)); state.pgProdutos = info.pag;
     const linhas = info.itens.map(p=>{
-      const avista = parseNum(p.prices[0]||0); const aprazo = avista*(1+pct/100); const custo = parseNum(p.cost||0);
-      const marg = avista>0 ? (avista-custo)/avista*100 : 0;
-      return `<tr class="clk" data-act="editprod" data-id="${p.id}"><td><b>${escapeHtml(p.name)}</b></td><td>${escapeHtml(p.fornecedor||'—')}</td><td class="r num">${money(custo)}</td><td class="r num">${money(avista)}</td><td class="r num">${money(aprazo)}</td><td class="r num" style="color:${marg<0?'var(--danger)':'var(--success)'};">${marg.toFixed(1).replace('.',',')}%</td></tr>`;
+      const preco = tabPadrao ? calcPrecoTabela(p, tabPadrao.id) : 0; const custo = parseNum(p.cost||0);
+      const marg = preco>0 ? (preco-custo)/preco*100 : 0;
+      return `<tr class="clk" data-act="editprod" data-id="${p.id}"><td><b>${escapeHtml(p.name)}</b></td><td>${escapeHtml(p.fornecedor||'—')}</td><td class="r num">${money(custo)}</td><td class="r num">${money(preco)}</td><td class="r num" style="color:${marg<0?'var(--danger)':'var(--success)'};">${marg.toFixed(1).replace('.',',')}%</td></tr>`;
     }).join('');
     return `<div class="rel-wrap"><table class="rel-table dtbl">
-      <thead><tr><th>Produto</th><th>Fornecedor</th><th class="r">Custo</th><th class="r">À vista</th><th class="r">${escapeHtml(vezesLabel)}</th><th class="r">Margem à vista</th></tr></thead>
+      <thead><tr><th>Produto</th><th>Fornecedor</th><th class="r">Custo</th><th class="r">${escapeHtml(vezesLabel)}</th><th class="r">Margem</th></tr></thead>
       <tbody>${linhas}</tbody></table></div>${pagerHtml('prod', info)}`;
   }
-  const head = `<div class="prod-table-head"><span>Produto</span><span class="r" style="text-align:right;">Custo</span><span class="r" style="text-align:right;">À vista</span><span class="r" style="text-align:right;">${escapeHtml(vezesLabel)}</span></div>`;
+  const head = `<div class="prod-table-head"><span>Produto</span><span class="r" style="text-align:right;">Custo</span><span class="r" style="text-align:right;">${escapeHtml(vezesLabel)}</span></div>`;
   const rows = filtered.map(p=>{
-    const avista = parseNum(p.prices[0]||0);
-    const aprazo = avista*(1+pct/100);
-    return `<div class="prod-table-row" data-act="editprod" data-id="${p.id}">
+    const preco = tabPadrao ? calcPrecoTabela(p, tabPadrao.id) : 0;
+    return `<div class="prod-table-row" data-act="editprod" data-id="${p.id}" style="grid-template-columns:1fr 74px 84px;">
       <div class="pnamewrap"><span class="pname">${escapeHtml(p.name)}</span>${p.fornecedor?`<span class="pforn">${escapeHtml(p.fornecedor)}</span>`:''}</div>
       <span class="num r" style="text-align:right; opacity:.6;">${money(p.cost||0)}</span>
-      <span class="num r" style="text-align:right;">${money(avista)}</span>
-      <span class="num r" style="text-align:right;">${money(aprazo)}</span>
+      <span class="num r" style="text-align:right;">${money(preco)}</span>
     </div>`;
   }).join('');
   return head + rows;
@@ -3113,15 +3159,28 @@ function wireProdRows(){
   wirePager('prod', 'pgProdutos', ()=>{ const wrap=document.getElementById('prodResultsWrap'); if(wrap){ wrap.innerHTML = prodRowsHtml(); wireProdRows(); } });
 }
 function productModal(prod){
-  const labels = state.config.priceLabels; const isNew = !prod;
-  prod = prod || { id:uid(), name:"", cost:"", prices:labels.map(()=>""), fornecedor:state.config.fornecedores[0]||"" };
+  const isNew = !prod;
+  prod = prod || { id:uid(), name:"", cost:"", overrides:{}, fornecedor:state.config.fornecedores[0]||"" };
+  if(!prod.overrides) prod.overrides = {};
   const root = document.getElementById('modalRoot');
   root.innerHTML = `<div class="modal-bg" id="mbg"><div class="modal">
     <div class="modal-head"><h3>${isNew?'Novo produto':'Editar produto'}</h3><button id="mclose">✕</button></div>
     <div class="field"><label>Nome do produto</label><input type="text" id="pname" value="${escapeHtml(prod.name)}" placeholder="Ex: Textura Grafiato 25kg"></div>
     <div class="field"><label>Fornecedor</label><select id="pfornecedor">${state.config.fornecedores.map(f=>`<option value="${escapeHtml(f)}" ${(prod.fornecedor||state.config.fornecedores[0])===f?'selected':''}>${escapeHtml(f)}</option>`).join('')}</select></div>
     <div class="field"><label>Seu custo (o que você paga) (R$)</label><input type="text" inputmode="numeric" id="pcost" placeholder="0,00"></div>
-    ${labels.map((l,i)=>`<div class="field"><label>${escapeHtml(l)} — preço de venda (R$)</label><input type="text" inputmode="numeric" id="pprice${i}" placeholder="0,00"></div>`).join('')}
+    <div class="eyebrow" style="margin-top:6px;">Tabelas de preço</div>
+    ${tabelasAtivas().length ? tabelasAtivas().map(t=>{
+      const manual = t.modo==='manual';
+      const ov = prod.overrides[t.id];
+      const desc = t.modo==='custo' ? '% sobre o custo' : t.modo==='tabela1' ? '% sobre a Tabela 1' : t.modo==='anterior' ? '% sobre a tabela anterior' : 'valor manual';
+      return `<div class="field">
+        <label>${escapeHtml(t.nome)} <span class="muted" style="font-weight:400;">(${desc}${t.modo!=='manual' && t.percent?' de '+String(t.percent).replace('.',',')+'%':''})</span></label>
+        <div class="row" style="align-items:center;">
+          ${manual?'':`<div class="kpi" style="flex:1; cursor:default; padding:9px 12px;"><div class="kl" style="margin:0;">Calculado</div><div class="kv" style="font-size:15px;">R$ ${money(calcPrecoTabela(prod, t.id))}</div></div>`}
+          <input type="text" inputmode="numeric" class="cell" id="pov_${t.id}" placeholder="${manual?'0,00':'deixe vazio p/ usar a fórmula'}" style="flex:1;">
+        </div>
+      </div>`;
+    }).join('') : `<p class="muted">Nenhuma tabela de preço ativa — cadastre em Ajustes → Tabelas de preço.</p>`}
     <div class="row" style="margin-top:14px;">${!isNew?`<button class="btn-danger btn-block" id="pdel">Excluir</button>`:''}<button class="btn-primary btn-block" id="psave">Salvar</button></div>
   </div></div>`;
   document.getElementById('mclose').onclick = closeModal;
@@ -3129,13 +3188,21 @@ function productModal(prod){
   noAccentInput(document.getElementById('pname'));
   document.getElementById('pname').focus();
   const pcostEl = document.getElementById('pcost'); wireMoneyInput(pcostEl); setMoneyInputValue(pcostEl, prod.cost);
-  labels.forEach((_,i)=>{ const el = document.getElementById('pprice'+i); wireMoneyInput(el); setMoneyInputValue(el, prod.prices[i]); });
+  pcostEl.addEventListener('input', ()=>{
+    prod.cost = moneyInputToNumber(pcostEl.value);
+    tabelasAtivas().forEach(t=>{ const kv = document.querySelector('#pov_'+t.id)?.closest('.field')?.querySelector('.kv'); if(kv) kv.textContent = 'R$ '+money(calcPrecoTabela(prod, t.id)); });
+  });
+  tabelasAtivas().forEach(t=>{ const el = document.getElementById('pov_'+t.id); if(!el) return; wireMoneyInput(el); if(prod.overrides[t.id]!==undefined && prod.overrides[t.id]!==null && prod.overrides[t.id]!=='') setMoneyInputValue(el, prod.overrides[t.id]); });
   const del = document.getElementById('pdel'); if(del) del.onclick = ()=>{ if(confirm('Excluir este produto?')){ state.products=state.products.filter(p=>p.id!==prod.id); saveProducts(); closeModal(); render(); toast('Produto excluído'); } };
   document.getElementById('psave').onclick = async ()=>{
     const name = document.getElementById('pname').value.trim(); if(!name){ toast('Digite o nome do produto'); return; }
     prod.name=name; prod.cost = moneyInputToNumber(document.getElementById('pcost').value);
     prod.fornecedor = document.getElementById('pfornecedor').value;
-    prod.prices = labels.map((_,i)=>moneyInputToNumber(document.getElementById('pprice'+i).value));
+    tabelasAtivas().forEach(t=>{
+      const el = document.getElementById('pov_'+t.id); if(!el) return;
+      const raw = el.value.trim();
+      if(raw==='') delete prod.overrides[t.id]; else prod.overrides[t.id] = moneyInputToNumber(raw);
+    });
     if(isNew) state.products.push(prod); else { const idx=state.products.findIndex(p=>p.id===prod.id); state.products[idx]=prod; }
     const ok = await saveProducts(); closeModal(); render(); if(ok) toast('Produto salvo');
   };
@@ -3204,15 +3271,14 @@ function openClientPicker(onSelect){
   inp.addEventListener('input', ()=> renderList(inp.value));
   inp.focus();
 }
-function quickProductModal(priceIdx, onUse){
-  const labels = state.config.priceLabels;
+function quickProductModal(priceTableId, onUse){
   const root = document.getElementById('modalRoot');
   root.innerHTML = `<div class="modal-bg" id="mbg"><div class="modal">
     <div class="modal-head"><h3>Novo produto</h3><button id="mclose">✕</button></div>
     <div class="field"><label>Nome do produto</label><input type="text" id="qpname" placeholder="Ex: Textura Grafiato 25kg"></div>
     <div class="field"><label>Fornecedor</label><select id="qpfornecedor">${state.config.fornecedores.map(f=>`<option value="${escapeHtml(f)}">${escapeHtml(f)}</option>`).join('')}</select></div>
     <div class="field"><label>Seu custo (R$)</label><input type="text" inputmode="numeric" id="qpcost" placeholder="0,00"></div>
-    <div class="field"><label>${escapeHtml(labels[priceIdx]||'Preço')} — preço de venda (R$)</label><input type="text" inputmode="numeric" id="qpprice" placeholder="0,00"></div>
+    <div class="field"><label>${escapeHtml(nomeTabela(priceTableId)||'Preço')} — preço de venda (R$)</label><input type="text" inputmode="numeric" id="qpprice" placeholder="0,00"></div>
     <p class="muted" style="margin-top:-4px;">Escolha se quer usar esse produto só neste orçamento ou salvá-lo no catálogo para usar depois.</p>
     <div class="row" style="margin-top:14px;">
       <button class="btn-ghost btn-block" id="qpUseOnce">Usar só aqui (1x)</button>
@@ -3242,8 +3308,8 @@ function quickProductModal(priceIdx, onUse){
   document.getElementById('qpSaveCatalog').onclick = async ()=>{
     const { name, fornecedor, cost, priceVal } = readData();
     if(!name){ toast('Digite o nome do produto'); return; }
-    const prices = state.config.priceLabels.map((_,i)=> i===priceIdx ? priceVal : 0);
-    const prod = { id:uid(), name, fornecedor, cost, prices };
+    const overrides = {}; if(priceTableId) overrides[priceTableId] = priceVal;
+    const prod = { id:uid(), name, fornecedor, cost, overrides };
     state.products.push(prod);
     const ok = await saveProducts();
     closeModal();
@@ -3251,7 +3317,7 @@ function quickProductModal(priceIdx, onUse){
     onUse({ name:prod.name, fornecedor:prod.fornecedor, cost:prod.cost, price:priceVal, productId:prod.id });
   };
 }
-function openProductPicker(priceIdx, onSelect){
+function openProductPicker(priceTableId, onSelect){
   const root = document.getElementById('modalRoot');
   root.innerHTML = `<div class="modal-bg" id="mbg"><div class="modal" style="height:78vh; max-height:78vh; display:flex; flex-direction:column;">
     <div class="modal-head"><h3>Selecionar produto</h3><button id="mclose">✕</button></div>
@@ -3268,7 +3334,7 @@ function openProductPicker(priceIdx, onSelect){
   document.getElementById('mclose').onclick = closeModal;
   document.getElementById('mbg').addEventListener('click', e=>{ if(e.target.id==='mbg') closeModal(); });
   document.getElementById('pickerNewProd').addEventListener('click', ()=>{
-    quickProductModal(priceIdx, data=> onSelect(data));
+    quickProductModal(priceTableId, data=> onSelect(data));
   });
   const listEl = document.getElementById('pickerList');
   const fornSel = document.getElementById('pickerForn');
@@ -3279,7 +3345,7 @@ function openProductPicker(priceIdx, onSelect){
     if(forn) items = items.filter(p=>p.fornecedor===forn);
     if(nq) items = items.filter(p=>normSearch(p.name).includes(nq) || normSearch(p.fornecedor||'').includes(nq));
     else items = items.sort((a,b)=>a.name.localeCompare(b.name,'pt-BR'));
-    listEl.innerHTML = items.length ? items.map(p=>`<div class="list-row" data-pid="${p.id}" style="cursor:pointer;"><div class="info"><b>${escapeHtml(p.name)}</b>${p.fornecedor?`<span>${escapeHtml(p.fornecedor)}</span>`:''}</div><div class="num" style="font-weight:700;">R$ ${money(p.prices[priceIdx]||0)}</div></div>`).join('') : `<div class="empty-state">Nenhum produto encontrado</div>`;
+    listEl.innerHTML = items.length ? items.map(p=>`<div class="list-row" data-pid="${p.id}" style="cursor:pointer;"><div class="info"><b>${escapeHtml(p.name)}</b>${p.fornecedor?`<span>${escapeHtml(p.fornecedor)}</span>`:''}</div><div class="num" style="font-weight:700;">R$ ${money(calcPrecoTabela(p, priceTableId))}</div></div>`).join('') : `<div class="empty-state">Nenhum produto encontrado</div>`;
     listEl.querySelectorAll('[data-pid]').forEach(row=> row.addEventListener('click', ()=>{ onSelect(row.dataset.pid); closeModal(); }));
   };
   renderList();
@@ -3290,6 +3356,7 @@ function openProductPicker(priceIdx, onSelect){
 
 /* ================= CLIENTES ================= */
 let cliFilter = "";
+let _priceTablesSnapshot = null;
 function renderClientes(){
   return `
     <div class="card sticky-head"><div class="eyebrow">Clientes (${state.clients.length})</div>
@@ -3356,7 +3423,7 @@ function wireCliRows(){
 }
 function clientModal(cli){
   const isNew = !cli;
-  cli = cli || { id:uid(), tipo:'PF', name:'', fantasia:'', doc:'', ie:'', phone:'', phone2:'', email:'', contato:'', cep:'', address:'', numero:'', complemento:'', bairro:'', cidade:'', uf:'', obs:'' };
+  cli = cli || { id:uid(), tipo:'PF', name:'', fantasia:'', doc:'', ie:'', phone:'', phone2:'', email:'', contato:'', cep:'', address:'', numero:'', complemento:'', bairro:'', cidade:'', uf:'', obs:'', tabelaPadraoId:'' };
   const v = k => escapeHtml(cli[k]||'');
   const root = document.getElementById('modalRoot');
   root.innerHTML = `<div class="modal-bg" id="mbg"><div class="modal wide">
@@ -3386,6 +3453,7 @@ function clientModal(cli){
       <div class="field"><label>Cidade</label><input type="text" id="ccidade" value="${v('cidade')}"></div>
       <div class="field"><label>UF</label><input type="text" id="cuf" maxlength="2" value="${v('uf')}" style="text-transform:uppercase;"></div>
     </div>
+    <div class="field"><label>Tabela de preço deste cliente</label><select id="ctabela"><option value="">Padrão da empresa (${escapeHtml(nomeTabela(state.config.tabelaPadraoSemCliente)||'—')})</option>${tabelasAtivas().map(t=>`<option value="${t.id}" ${cli.tabelaPadraoId===t.id?'selected':''}>${escapeHtml(t.nome)}</option>`).join('')}</select><p class="muted" style="margin:6px 0 0;">Essa tabela já vem selecionada quando montar um orçamento para este cliente — dá para trocar na hora, se precisar.</p></div>
     <div class="field"><label>Observações</label><textarea id="cobs" rows="3" style="resize:vertical;">${v('obs')}</textarea></div>
     <div class="row" style="margin-top:14px;">${!isNew?`<button class="btn-danger btn-block" id="cdel">Excluir</button>`:''}<button class="btn-primary btn-block" id="csave">Salvar</button></div>
   </div></div>`;
@@ -3448,7 +3516,7 @@ function clientModal(cli){
       contato: $('ccontato').value.trim(),
       cep: $('ccep').value.trim(), address: $('caddr').value.trim(), numero: $('cnum').value.trim(),
       complemento: $('ccomp').value.trim(), bairro: $('cbairro').value.trim(), cidade: $('ccidade').value.trim(),
-      uf: $('cuf').value.trim().toUpperCase(), obs: $('cobs').value.trim()
+      uf: $('cuf').value.trim().toUpperCase(), obs: $('cobs').value.trim(), tabelaPadraoId: $('ctabela').value
     });
     if(isNew) state.clients.push(cli); else { const idx=state.clients.findIndex(c=>c.id===cli.id); state.clients[idx]=cli; }
     const ok = await saveClients(); closeModal(); render(); if(ok) toast('Cliente salvo');
@@ -3539,10 +3607,30 @@ function renderAjustes(){
     <div class="field"><label>QR Code (opcional)</label><div id="qrPreviewWrap">${state.qrDataUrl?`<img ${'s'+'rc'}="${state.qrDataUrl}" class="imgpreview" style="max-width:120px;">`:''}</div><input type="file" accept="image/*" id="cfgQrFile"></div>
   </div>
   <div class="card">
-    <div class="eyebrow">Tabelas de preço (até 3)</div>
-    <p class="muted" style="margin-top:-4px;">Nomeie as colunas de preço do catálogo, ex: "À vista", "Parcelado".</p>
-    ${cfg.priceLabels.map((l,i)=>`<div class="field"><label>Tabela ${i+1}</label><div class="row"><input type="text" data-cfgprice="${i}" value="${escapeHtml(l)}"> ${cfg.priceLabels.length>1?`<button class="btn-danger btn-sm" data-act="rmprice" data-i="${i}">Remover</button>`:''}</div></div>`).join('')}
-    ${cfg.priceLabels.length<3?`<button class="btn-secondary btn-block" data-act="addprice">+ Adicionar tabela de preço</button>`:''}
+    <div class="eyebrow">Tabelas de preço</div>
+    <p class="muted" style="margin-top:-4px;">Até 8 tabelas. Cada uma calcula sozinha — mude o custo do produto ou a Tabela 1 e as que dependem delas acompanham na hora. Editar aqui a fórmula ou o percentual de uma tabela já existente pede confirmação, porque afeta vários produtos de uma vez.</p>
+    ${(cfg.priceTables||[]).map((t,i)=>{
+      const primeira = i===0;
+      const modos = [['custo','% sobre o custo'], ['tabela1','% sobre a Tabela 1'], ['anterior','% sobre a tabela anterior'], ['manual','Manual (digitado por produto)']];
+      return `<div class="section-block" data-tabela-row="${i}">
+        <div class="row" style="align-items:center; margin-bottom:8px;">
+          <input type="text" data-tabnome="${i}" value="${escapeHtml(t.nome)}" placeholder="Nome da tabela" style="font-weight:700;">
+          <label style="display:flex; align-items:center; gap:6px; flex:none; margin:0; white-space:nowrap;"><input type="checkbox" data-tabativa="${i}" ${t.ativo!==false?'checked':''} style="width:18px;height:18px;"> ativa</label>
+        </div>
+        <div class="row">
+          <div class="field" style="flex:2; margin-bottom:0;"><label>Como calcular</label><select data-tabmodo="${i}">${modos.map(([v,l])=>`<option value="${v}" ${t.modo===v?'selected':''} ${primeira&&(v==='tabela1'||v==='anterior')?'disabled':''}>${l}</option>`).join('')}</select></div>
+          <div class="field" data-tabpercentwrap="${i}" style="flex:1; margin-bottom:0; ${t.modo==='manual'?'display:none;':''}"><label>Percentual (%)</label><input type="number" step="0.01" data-tabpercent="${i}" value="${t.percent!=null?t.percent:0}"></div>
+        </div>
+        ${primeira?`<p class="muted" style="margin:8px 0 0;">A primeira tabela é a base das outras — só pode ser por custo ou manual.</p>`:''}
+        <div class="row" style="margin-top:8px; gap:6px;">
+          <button type="button" class="btn-ghost btn-sm" data-act="tabup" data-i="${i}" ${i===0?'disabled':''}>↑ Subir</button>
+          <button type="button" class="btn-ghost btn-sm" data-act="tabdown" data-i="${i}" ${i===(cfg.priceTables.length-1)?'disabled':''}>↓ Descer</button>
+          ${cfg.priceTables.length>1?`<button type="button" class="btn-danger btn-sm" data-act="tabdel" data-i="${i}">Remover</button>`:''}
+        </div>
+      </div>`;
+    }).join('')}
+    ${(cfg.priceTables||[]).length<8?`<button class="btn-secondary btn-block" data-act="tabadd">+ Adicionar tabela de preço</button>`:`<p class="muted">Limite de 8 tabelas atingido.</p>`}
+    <div class="field" style="margin-top:12px; margin-bottom:0;"><label>Tabela padrão para cliente sem tabela definida</label><select id="cfgTabelaPadrao">${(cfg.priceTables||[]).filter(t=>t.ativo!==false).map(t=>`<option value="${t.id}" ${cfg.tabelaPadraoSemCliente===t.id?'selected':''}>${escapeHtml(t.nome)}</option>`).join('')}</select></div>
   </div>
   <div class="card">
     <div class="eyebrow">Parcelamento (quantas vezes e acréscimo)</div>
@@ -3567,6 +3655,68 @@ function renderAjustes(){
   `;
 }
 
+/* Recalcula todo o catálogo com um jogo de tabelas (antigo ou novo) e devolve {produtoId__tabelaId: valor}. */
+function snapshotPrecos(tabelas){
+  const mapa = {};
+  state.products.forEach(prod=> tabelas.forEach(t=>{ mapa[prod.id+'__'+t.id] = calcPrecoTabela(prod, t.id, tabelas); }));
+  return mapa;
+}
+function diffTabelasDePreco(antigas, novas){
+  const idsComuns = novas.filter(t=>antigas.some(a=>a.id===t.id)).map(t=>t.id);
+  if(!idsComuns.length) return [];
+  const antes = snapshotPrecos(antigas), depois = snapshotPrecos(novas);
+  const linhas = [];
+  state.products.forEach(prod=>{
+    idsComuns.forEach(tid=>{
+      const ov = prod.overrides ? prod.overrides[tid] : undefined;
+      if(ov!==undefined && ov!==null && ov!=='') return; // sobrescrita manual nunca muda
+      const a = antes[prod.id+'__'+tid], d = depois[prod.id+'__'+tid];
+      if(Math.abs((a||0)-(d||0))>0.004) linhas.push({ produto:prod.name, tabela:nomeTabela(tid), antes:a||0, depois:d||0 });
+    });
+  });
+  return linhas;
+}
+function confirmarImpactoTabelas(linhas, onConfirm){
+  const root = document.getElementById('modalRoot');
+  root.innerHTML = `<div class="modal-bg" id="mbg"><div class="modal wide">
+    <div class="modal-head"><h3>Confirmar mudança nas tabelas de preço</h3><button id="mclose">✕</button></div>
+    <p class="muted" style="margin-top:-6px;">Essa mudança afeta o preço calculado de ${linhas.length} ${linhas.length===1?'produto':'produtos'}. Itens com valor digitado manualmente naquela tabela não mudam. Confira antes de salvar:</p>
+    <div class="rel-wrap"><table class="rel-table"><thead><tr><th>Produto</th><th>Tabela</th><th class="r">Valor atual</th><th class="r">Valor novo</th></tr></thead>
+    <tbody>${linhas.map(l=>`<tr><td>${escapeHtml(l.produto)}</td><td>${escapeHtml(l.tabela)}</td><td class="r num">R$ ${money(l.antes)}</td><td class="r num" style="font-weight:700; color:${l.depois>l.antes?'var(--success)':(l.depois<l.antes?'var(--danger)':'var(--ink)')};">R$ ${money(l.depois)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="row" style="margin-top:14px;"><button class="btn-ghost btn-block" id="cImCancel">Cancelar</button><button class="btn-primary btn-block" id="cImOk">Confirmar e salvar</button></div>
+  </div></div>`;
+  document.getElementById('mclose').onclick = closeModal;
+  document.getElementById('cImCancel').onclick = closeModal;
+  document.getElementById('mbg').addEventListener('click', e=>{ if(e.target.id==='mbg') closeModal(); });
+  document.getElementById('cImOk').onclick = ()=>{ closeModal(); onConfirm(); };
+}
+/* Uma tabela "% sobre a Tabela 1" ou "% sobre a anterior" só funciona na 1ª posição se virar custo/manual —
+   nunca deixo uma tabela apontar pra ela mesma por engano. */
+function corrigirPrimeiraTabela(){
+  const t0 = state.config.priceTables[0];
+  if(t0 && (t0.modo==='tabela1' || t0.modo==='anterior')) t0.modo='custo';
+}
+/* Se eu apagar (ou, por reordenação, deslocar) a tabela que servia de base para outra em modo fórmula,
+   a dependente não pode quebrar nem mudar de base sem avisar: ela congela no último valor calculado
+   (vira manual, com o valor atual salvo por produto) até alguém mudar a fórmula dela de novo. */
+function congelarDependentesDaTabela(delId){
+  const tabelas = state.config.priceTables;
+  const delIdx = tabelas.findIndex(t=>t.id===delId);
+  if(delIdx<0) return;
+  const antes = snapshotPrecos(tabelas);
+  tabelas.forEach((t,idx)=>{
+    if(t.id===delId) return;
+    const afetado = (t.modo==='tabela1' && delIdx===0) || (t.modo==='anterior' && idx>0 && tabelas[idx-1].id===delId);
+    if(!afetado) return;
+    t.modo='manual';
+    state.products.forEach(prod=>{
+      prod.overrides = prod.overrides||{};
+      const jaTinha = prod.overrides[t.id]!==undefined && prod.overrides[t.id]!==null && prod.overrides[t.id]!=='';
+      if(!jaTinha) prod.overrides[t.id] = antes[prod.id+'__'+t.id] || 0;
+    });
+  });
+}
+
 /* ---------------- eventos genéricos ---------------- */
 function wireOtherTabs(){
   const app = document.getElementById('app');
@@ -3582,12 +3732,37 @@ function wireOtherTabs(){
     wireCliRows();
   }
   if(state.tab==='ajustes'){
+    if(_priceTablesSnapshot===null) _priceTablesSnapshot = JSON.parse(JSON.stringify(state.config.priceTables||[]));
     const cfgEnd = app.querySelector('#cfgEndereco'); if(cfgEnd) noAccentInput(cfgEnd);
-    app.querySelectorAll('[data-cfgprice]').forEach(inp=> inp.addEventListener('input', e=>{ state.config.priceLabels[Number(inp.dataset.cfgprice)]=e.target.value; }));
-    const addp = app.querySelector('[data-act=addprice]'); if(addp) addp.addEventListener('click', ()=>{
-      if(state.config.priceLabels.length<3){ state.config.priceLabels.push('Tabela '+(state.config.priceLabels.length+1)); state.products.forEach(p=>{ while(p.prices.length<state.config.priceLabels.length) p.prices.push(0); }); render(); }
+    app.querySelectorAll('[data-tabnome]').forEach(inp=> inp.addEventListener('input', e=>{ state.config.priceTables[Number(inp.dataset.tabnome)].nome=e.target.value; }));
+    app.querySelectorAll('[data-tabativa]').forEach(cb=> cb.addEventListener('change', e=>{ state.config.priceTables[Number(cb.dataset.tabativa)].ativo=e.target.checked; render(); }));
+    app.querySelectorAll('[data-tabmodo]').forEach(sel=> sel.addEventListener('change', e=>{
+      const i=Number(sel.dataset.tabmodo); state.config.priceTables[i].modo=e.target.value; render();
+    }));
+    app.querySelectorAll('[data-tabpercent]').forEach(inp=> inp.addEventListener('input', e=>{ state.config.priceTables[Number(inp.dataset.tabpercent)].percent=parseNum(e.target.value); }));
+    const tabadd = app.querySelector('[data-act=tabadd]'); if(tabadd) tabadd.addEventListener('click', ()=>{
+      if(state.config.priceTables.length>=8) return;
+      let n=1; while(state.config.priceTables.some(t=>t.id==='t'+n)) n++;
+      state.config.priceTables.push({ id:'t'+n, nome:'Nova tabela', modo:'manual', percent:0, ativo:true }); render();
     });
-    app.querySelectorAll('[data-act=rmprice]').forEach(btn=> btn.addEventListener('click', ()=>{ const i=Number(btn.dataset.i); state.config.priceLabels.splice(i,1); state.products.forEach(p=>p.prices.splice(i,1)); render(); }));
+    app.querySelectorAll('[data-act=tabup]').forEach(btn=> btn.addEventListener('click', ()=>{
+      const i=Number(btn.dataset.i); if(i<=0) return;
+      const arr=state.config.priceTables; [arr[i-1],arr[i]]=[arr[i],arr[i-1]];
+      corrigirPrimeiraTabela(); render();
+    }));
+    app.querySelectorAll('[data-act=tabdown]').forEach(btn=> btn.addEventListener('click', ()=>{
+      const i=Number(btn.dataset.i); const arr=state.config.priceTables; if(i>=arr.length-1) return;
+      [arr[i+1],arr[i]]=[arr[i],arr[i+1]];
+      corrigirPrimeiraTabela(); render();
+    }));
+    app.querySelectorAll('[data-act=tabdel]').forEach(btn=> btn.addEventListener('click', ()=>{
+      if(state.config.priceTables.length<=1) return;
+      const i=Number(btn.dataset.i); const t=state.config.priceTables[i];
+      if(!confirm('Remover a tabela "'+(t.nome||'')+'"? Tabelas que calculavam a partir dela continuam com o preço de hoje, mas passam a ser editadas manualmente.')) return;
+      congelarDependentesDaTabela(t.id);
+      state.config.priceTables.splice(i,1);
+      corrigirPrimeiraTabela(); render();
+    }));
 
     app.querySelectorAll('[data-inst]').forEach(inp=> inp.addEventListener('input', e=>{
       const i = Number(inp.dataset.i); const field = inp.dataset.inst;
@@ -3636,6 +3811,11 @@ function wireOtherTabs(){
     app.querySelectorAll('[data-act=rmforma]').forEach(btn=> btn.addEventListener('click', ()=>{ state.config.formasPagamento.splice(Number(btn.dataset.i),1); render(); }));
 
     const save = app.querySelector('[data-act=savecfg]'); if(save) save.addEventListener('click', async ()=>{
+      const linhasDiff = _priceTablesSnapshot ? diffTabelasDePreco(_priceTablesSnapshot, state.config.priceTables||[]) : [];
+      const prosseguir = ()=> salvarAjustesDeFato(save);
+      if(linhasDiff.length) confirmarImpactoTabelas(linhasDiff, prosseguir); else prosseguir();
+    });
+    async function salvarAjustesDeFato(save){
       state.config.empresa = document.getElementById('cfgEmpresa').value.trim();
       state.config.telefone = document.getElementById('cfgTel').value.trim();
       state.config.cidade = document.getElementById('cfgCidade').value.trim();
@@ -3653,12 +3833,13 @@ function wireOtherTabs(){
       state.config.pix.chave = document.getElementById('cfgPix').value.trim();
       state.config.feeCardDefault = { type:document.getElementById('cfgCardType').value, value:document.getElementById('cfgCardVal').value };
       state.config.feeNotaDefault = { type:document.getElementById('cfgNotaType').value, value:document.getElementById('cfgNotaVal').value };
+      const tp = document.getElementById('cfgTabelaPadrao'); if(tp) state.config.tabelaPadraoSemCliente = tp.value;
       save.disabled = true; save.textContent = 'Salvando...';
       const ok1 = await saveConfig(); const ok2 = await saveProducts();
       save.disabled = false; save.textContent = 'Salvar ajustes';
-      if(ok1 && ok2) toast('Ajustes salvos');
+      if(ok1 && ok2){ toast('Ajustes salvos'); _priceTablesSnapshot = JSON.parse(JSON.stringify(state.config.priceTables||[])); }
       checkLock(); render();
-    });
+    }
     const exp = app.querySelector('[data-act=exportarexcel]'); if(exp) exp.addEventListener('click', async ()=>{ exportarDadosExcel(); await marcarBackupFeito(); });
     const expJson = app.querySelector('[data-act=exportarjson]'); if(expJson) expJson.addEventListener('click', async ()=>{ exportarBackupJSON(); await marcarBackupFeito(); });
     const impJson = app.querySelector('#cfgImportBackup'); if(impJson) impJson.addEventListener('change', e=>{
@@ -4222,8 +4403,8 @@ async function gerarPDF(){
   else state.pedidos.push(pedido);
   savePedidos();
 
-  const htmlContent = pdfHtmlFor(clienteNome, clienteTel, cfg.priceLabels[b.priceIdx], b.sections, t.subtotal, t.parcelPercentRaw, t.desconto, b.cardFee.on, t.card, b.notaFee.on, t.nota, t.total, installLabel, pedido.numero, pedido.vendedorNome);
-  const pdfArgs = [clienteNome, clienteTel, cfg.priceLabels[b.priceIdx], b.sections, t.subtotal, t.parcelPercentRaw, t.desconto, b.cardFee.on, t.card, b.notaFee.on, t.nota, t.total, installLabel, pedido.numero, pedido.vendedorNome];
+  const htmlContent = pdfHtmlFor(clienteNome, clienteTel, pedido.priceTableNome||'', b.sections, t.subtotal, t.parcelPercentRaw, t.desconto, b.cardFee.on, t.card, b.notaFee.on, t.nota, t.total, installLabel, pedido.numero, pedido.vendedorNome);
+  const pdfArgs = [clienteNome, clienteTel, pedido.priceTableNome||'', b.sections, t.subtotal, t.parcelPercentRaw, t.desconto, b.cardFee.on, t.card, b.notaFee.on, t.nota, t.total, installLabel, pedido.numero, pedido.vendedorNome];
 
   gerarEMostrarPdf(clienteNome, clienteTel, htmlContent, pdfArgs);
   state.budget = newBudget();
@@ -4246,18 +4427,18 @@ function gerarPDFdePedido(p){
   const baseComDesconto = base - t.desconto;
   if(p.cardFee && p.cardFee.on) t.card = p.cardFee.type==='%' ? baseComDesconto*parseNum(p.cardFee.value)/100 : parseNum(p.cardFee.value);
   if(p.notaFee && p.notaFee.on) t.nota = p.notaFee.type==='%' ? baseComDesconto*parseNum(p.notaFee.value)/100 : parseNum(p.notaFee.value);
-  const htmlContent = pdfHtmlFor(p.clientName, p.clientPhone, cfg.priceLabels[p.priceIdx]||'', p.sections, p.subtotal, pctRaw, t.desconto, p.cardFee&&p.cardFee.on, t.card, p.notaFee&&p.notaFee.on, t.nota, p.total, installLabel, p.numero, p.vendedorNome);
-  const pdfArgs = [p.clientName, p.clientPhone, cfg.priceLabels[p.priceIdx]||'', p.sections, p.subtotal, pctRaw, t.desconto, p.cardFee&&p.cardFee.on, t.card, p.notaFee&&p.notaFee.on, t.nota, p.total, installLabel, p.numero, p.vendedorNome];
+  const htmlContent = pdfHtmlFor(p.clientName, p.clientPhone, p.priceTableNome||'', p.sections, p.subtotal, pctRaw, t.desconto, p.cardFee&&p.cardFee.on, t.card, p.notaFee&&p.notaFee.on, t.nota, p.total, installLabel, p.numero, p.vendedorNome);
+  const pdfArgs = [p.clientName, p.clientPhone, p.priceTableNome||'', p.sections, p.subtotal, pctRaw, t.desconto, p.cardFee&&p.cardFee.on, t.card, p.notaFee&&p.notaFee.on, t.nota, p.total, installLabel, p.numero, p.vendedorNome];
   gerarEMostrarPdf(p.clientName||'pedido', p.clientPhone, htmlContent, pdfArgs);
 }
 
 /* ================= exportar backup (Excel) ================= */
 function exportarDadosExcel(){
   if(typeof XLSX === 'undefined'){ toast('Não consegui carregar o Excel — verifique a internet e tente de novo'); return; }
-  const labels = state.config.priceLabels;
+  const tabs = tabelasAtivas();
   const prodRows = state.products.map(p=>{
-    const row = { Nome:p.name, Custo:p.cost||0 };
-    labels.forEach((l,i)=>{ row[l] = p.prices[i]||0; });
+    const row = { Nome:p.name, Fornecedor:p.fornecedor||'', Custo:p.cost||0 };
+    tabs.forEach(t=>{ row[t.nome] = calcPrecoTabela(p, t.id); });
     return row;
   });
   const cliRows = state.clients.map(c=>({ Nome:c.name, Telefone:c.phone||'', Endereco:c.address||'' }));
